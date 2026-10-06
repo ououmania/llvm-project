@@ -1349,8 +1349,11 @@ ASTUnit::getMainBufferWithPrecompiledPreamble(
 
     llvm::ErrorOr<PrecompiledPreamble> NewPreamble = PrecompiledPreamble::Build(
         PreambleInvocationIn, MainFileBuffer.get(), Bounds, Diagnostics, VFS,
-        PCHContainerOps, StorePreamblesInMemory, PreambleStoragePath,
-        Callbacks);
+        PCHContainerOps,
+        StorePreamblesInMemory
+            ? PrecompiledPreamble::PCHStorageMode::InMemory
+            : PrecompiledPreamble::PCHStorageMode::TempFile,
+        PreambleStoragePath, Callbacks);
 
     PreambleInvocationIn.getFrontendOpts().SkipFunctionBodies =
         PreviousSkipFunctionBodies;

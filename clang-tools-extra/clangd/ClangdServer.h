@@ -118,6 +118,9 @@ public:
     /// This throttler controls which preambles may be built at a given time.
     clangd::PreambleThrottler *PreambleThrottler = nullptr;
 
+    /// If non-null, preamble PCH files are persisted to disk across restarts.
+    const clangd::PreambleCache *PreambleDiskCache = nullptr;
+
     /// Manages to build module files.
     ModulesBuilder *ModulesManager = nullptr;
 

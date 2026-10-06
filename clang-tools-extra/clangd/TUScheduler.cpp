@@ -54,6 +54,7 @@
 #include "GlobalCompilationDatabase.h"
 #include "ParsedAST.h"
 #include "Preamble.h"
+#include "PreambleCache.h"
 #include "clang-include-cleaner/Record.h"
 #include "support/Cancellation.h"
 #include "support/Context.h"
@@ -431,11 +432,11 @@ public:
                  bool StorePreambleInMemory, bool RunSync,
                  PreambleThrottler *Throttler, SynchronizedTUStatus &Status,
                  TUScheduler::HeaderIncluderCache &HeaderIncluders,
-                 ASTWorker &AW)
+                 ASTWorker &AW, const PreambleCache *Cache)
       : FileName(FileName), Callbacks(Callbacks),
         StoreInMemory(StorePreambleInMemory), RunSync(RunSync),
         Throttler(Throttler), Status(Status), ASTPeer(AW),
-        HeaderIncluders(HeaderIncluders) {}
+        HeaderIncluders(HeaderIncluders), Cache(Cache) {}
 
   /// It isn't guaranteed that each requested version will be built. If there
   /// are multiple update requests while building a preamble, only the last one
@@ -589,6 +590,7 @@ private:
   SynchronizedTUStatus &Status;
   ASTWorker &ASTPeer;
   TUScheduler::HeaderIncluderCache &HeaderIncluders;
+  const PreambleCache *Cache;
 };
 
 class ASTWorkerHandle;
@@ -842,7 +844,8 @@ ASTWorker::ASTWorker(PathRef FileName, const GlobalCompilationDatabase &CDB,
       ContextProvider(Opts.ContextProvider), CDB(CDB), Callbacks(Callbacks),
       Barrier(Barrier), Done(false), Status(FileName, Callbacks),
       PreamblePeer(FileName, Callbacks, Opts.StorePreamblesInMemory, RunSync,
-                   Opts.PreambleThrottler, Status, HeaderIncluders, *this) {
+                   Opts.PreambleThrottler, Status, HeaderIncluders, *this,
+                   Opts.PreambleDiskCache) {
   // Set a fallback command because compile command can be accessed before
   // `Inputs` is initialized. Other fields are only used after initialization
   // from client inputs.
@@ -1067,6 +1070,53 @@ void PreambleThread::build(Request Req) {
   if (!LatestBuild || Inputs.ForceRebuild) {
     vlog("Building first preamble for {0} version {1}", FileName,
          Inputs.Version);
+    // Try to restore from persistent cache on cold start.
+    if (!Inputs.ForceRebuild && Cache && !StoreInMemory) {
+      if (auto MetaOrErr = Cache->load(FileName, Inputs.CompileCommand)) {
+        std::string PCHPath =
+            Cache->stablePath(FileName, Inputs.CompileCommand);
+        if (auto PCHOrErr = PrecompiledPreamble::LoadFromFile(
+                PCHPath, std::move(MetaOrErr->PreambleBytes),
+                MetaOrErr->PreambleEndsAtStartOfLine,
+                std::move(MetaOrErr->FilesInPreamble),
+                std::move(MetaOrErr->MissingFiles))) {
+          auto ContentsBuffer =
+              llvm::MemoryBuffer::getMemBuffer(Inputs.Contents, FileName);
+          auto Bounds = computePreambleBounds(Req.CI->getLangOpts(),
+                                              *ContentsBuffer,
+                                              Inputs.Opts.SkipPreambleBuild);
+          auto VFS = Inputs.TFS->view(Inputs.CompileCommand.Directory);
+          if (PCHOrErr->CanReuse(*Req.CI, ContentsBuffer->getMemBufferRef(),
+                                 Bounds, *VFS)) {
+            log("PreambleCache: restored PCH for {0} (skipping rebuild)",
+                FileName);
+            auto Restored =
+                std::make_shared<PreambleData>(std::move(*PCHOrErr));
+            Restored->Version = Inputs.Version;
+            Restored->CompileCommand = Inputs.CompileCommand;
+            Restored->MainIsIncludeGuarded = MetaOrErr->MainIsIncludeGuarded;
+            Restored->TargetOpts = std::make_unique<TargetOptions>(
+                Req.CI->getTargetOpts());
+            Restored->Marks = std::move(MetaOrErr->Marks);
+            Restored->Macros = std::move(MetaOrErr->Macros);
+            Restored->Includes = std::move(MetaOrErr->Includes);
+            Restored->Pragmas =
+                std::make_shared<const include_cleaner::PragmaIncludes>(
+                    std::move(MetaOrErr->Pragmas));
+            LatestBuild = std::move(Restored);
+            ReusedPreamble = true;
+            if (isReliable(LatestBuild->CompileCommand))
+              HeaderIncluders.update(FileName,
+                                     LatestBuild->Includes.allHeaders());
+            return;
+          }
+          log("PreambleCache: cached PCH no longer valid for {0}, rebuilding",
+              FileName);
+        } else {
+          vlog("PreambleCache: failed to load PCH for {0}", FileName);
+        }
+      }
+    }
   } else if (isPreambleCompatible(*LatestBuild, Inputs, FileName, *Req.CI)) {
     vlog("Reusing preamble version {0} for version {1} of {2}",
          LatestBuild->Version, Inputs.Version, FileName);
@@ -1085,16 +1135,43 @@ void PreambleThread::build(Request Req) {
 
   PreambleBuildStats Stats;
   bool IsFirstPreamble = !LatestBuild;
+  auto Mode = StoreInMemory ? PrecompiledPreamble::PCHStorageMode::InMemory
+                            : PrecompiledPreamble::PCHStorageMode::TempFile;
+  std::string StablePCHPath;
+  if (Cache && !StoreInMemory) {
+    StablePCHPath = Cache->stablePath(FileName, Inputs.CompileCommand);
+    llvm::sys::fs::create_directories(
+        llvm::sys::path::parent_path(StablePCHPath));
+    Mode = PrecompiledPreamble::PCHStorageMode::PersistentFile;
+  }
   LatestBuild = clang::clangd::buildPreamble(
-      FileName, *Req.CI, Inputs, StoreInMemory,
+      FileName, *Req.CI, Inputs, Mode,
       [&](CapturedASTCtx ASTCtx,
           std::shared_ptr<const include_cleaner::PragmaIncludes> PI) {
         Callbacks.onPreambleAST(FileName, Inputs.Version, std::move(ASTCtx),
                                 std::move(PI));
       },
-      &Stats);
+      &Stats, StablePCHPath);
   if (!LatestBuild)
     return;
+  if (Cache && !StoreInMemory) {
+    PreambleCache::PreambleMeta Meta;
+    Meta.PreambleBytes.assign(LatestBuild->Preamble.getContents().begin(),
+                              LatestBuild->Preamble.getContents().end());
+    Meta.PreambleEndsAtStartOfLine =
+        (LatestBuild->Preamble.getBounds().PreambleEndsAtStartOfLine);
+    Meta.MainIsIncludeGuarded = LatestBuild->MainIsIncludeGuarded;
+    Meta.Marks = LatestBuild->Marks;
+    Meta.Macros = LatestBuild->Macros;
+    Meta.Includes = LatestBuild->Includes;
+    if (LatestBuild->Pragmas)
+      Meta.Pragmas = *LatestBuild->Pragmas;
+    if (auto Err = Cache->storeMeta(FileName, Inputs.CompileCommand, Meta))
+      elog("PreambleCache store failed for {0}: {1}", FileName,
+           std::move(Err));
+    else
+      log("PreambleCache: PCH persisted for {0}", FileName);
+  }
   reportPreambleBuild(Stats, IsFirstPreamble);
   if (isReliable(LatestBuild->CompileCommand))
     HeaderIncluders.update(FileName, LatestBuild->Includes.allHeaders());

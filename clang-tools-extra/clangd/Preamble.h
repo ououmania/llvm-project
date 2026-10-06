@@ -158,9 +158,11 @@ struct PreambleBuildStats {
 /// If Stats is not non-null, build statistics will be exported there.
 std::shared_ptr<const PreambleData>
 buildPreamble(PathRef FileName, CompilerInvocation CI,
-              const ParseInputs &Inputs, bool StoreInMemory,
+              const ParseInputs &Inputs,
+              PrecompiledPreamble::PCHStorageMode StorageMode,
               PreambleParsedCallback PreambleCallback,
-              PreambleBuildStats *Stats = nullptr);
+              PreambleBuildStats *Stats = nullptr,
+              llvm::StringRef PCHStoragePath = "");
 
 /// Returns true if \p Preamble is reusable for \p Inputs. Note that it will
 /// return true when some missing headers are now available.

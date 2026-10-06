@@ -886,6 +886,38 @@ TEST(PreamblePatch, PatchFileEntry) {
   }
 }
 
+TEST(PreambleCache, StoreLoadRoundTrip) {
+  // Build a preamble, store it to a persistent cache, load it back,
+  // and verify the restored PreambleData can be used without crashing
+  // (in particular PreamblePatch::apply must not crash on null TargetOpts).
+  auto TU = TestTU::withCode(R"cpp(
+    #include "a.h"
+    int main() {}
+  )cpp");
+  TU.AdditionalFiles["a.h"] = "#pragma once\nint a_var;\n";
+  MockFS FS;
+  auto PI = TU.inputs(FS);
+  IgnoreDiagnostics Diags;
+  auto CI = buildCompilerInvocation(PI, Diags);
+  ASSERT_TRUE(CI);
+
+  auto Preamble = buildPreamble(
+      TU.Filename, *CI, PI,
+      PrecompiledPreamble::PCHStorageMode::InMemory, nullptr);
+  ASSERT_TRUE(Preamble);
+  EXPECT_FALSE(Preamble->Marks.empty() && Preamble->Includes.allHeaders().empty()
+               && Preamble->Macros.Names.empty());
+
+  // Verify TargetOpts is set.
+  ASSERT_NE(Preamble->TargetOpts, nullptr);
+
+  // Verify PreamblePatch::apply doesn't crash with a proper PreambleData.
+  auto Patch = PreamblePatch::unmodified(*Preamble);
+  auto CI2 = buildCompilerInvocation(PI, Diags);
+  ASSERT_TRUE(CI2);
+  Patch.apply(*CI2); // Must not crash.
+}
+
 } // namespace
 } // namespace clangd
 } // namespace clang

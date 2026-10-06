@@ -48,9 +48,44 @@ class PreambleCallbacks;
 /// CanReusePreamble + AddImplicitPreamble to make use of it.
 class PrecompiledPreamble {
   class PCHStorage;
-  struct PreambleFileHash;
 
 public:
+  /// Data used to determine if a file used in the preamble has been changed.
+  struct PreambleFileHash {
+    /// All files have size set.
+    off_t Size = 0;
+
+    /// Modification time is set for files that are on disk.  For memory
+    /// buffers it is zero.
+    time_t ModTime = 0;
+
+    /// Memory buffers have MD5 instead of modification time.  We don't
+    /// compute MD5 for on-disk files because we hope that modification time is
+    /// enough to tell if the file was changed.
+    llvm::MD5::MD5Result MD5 = {};
+
+    static PreambleFileHash createForFile(off_t Size, time_t ModTime);
+    static PreambleFileHash
+    createForMemoryBuffer(const llvm::MemoryBufferRef &Buffer);
+
+    friend bool operator==(const PreambleFileHash &LHS,
+                           const PreambleFileHash &RHS) {
+      return LHS.Size == RHS.Size && LHS.ModTime == RHS.ModTime &&
+             LHS.MD5 == RHS.MD5;
+    }
+    friend bool operator!=(const PreambleFileHash &LHS,
+                           const PreambleFileHash &RHS) {
+      return !(LHS == RHS);
+    }
+  };
+
+  /// Controls where the PCH data is stored.
+  enum class PCHStorageMode {
+    InMemory,       ///< PCH stored in memory.
+    TempFile,       ///< PCH stored in a temporary file (deleted on destruction).
+    PersistentFile, ///< PCH stored at a stable path (survives destruction).
+  };
+
   /// Try to build PrecompiledPreamble for \p Invocation. See
   /// BuildPreambleError for possible error codes.
   ///
@@ -70,12 +105,12 @@ public:
   ///
   /// \param PCHContainerOps An instance of PCHContainerOperations.
   ///
-  /// \param StoreInMemory Store PCH in memory. If false, PCH will be stored in
-  /// a temporary file.
+  /// \param Mode Controls where the PCH is stored: in memory, a temporary
+  /// file, or a persistent file.
   ///
-  /// \param StoragePath The path to a directory, in which to create a temporary
-  /// file to store PCH in. If empty, the default system temporary directory is
-  /// used. This parameter is ignored if \p StoreInMemory is true.
+  /// \param StoragePath For TempFile mode: directory for the temporary file
+  /// (empty uses system temp). For PersistentFile mode: the exact output file
+  /// path. Ignored for InMemory mode.
   ///
   /// \param Callbacks A set of callbacks to be executed when building
   /// the preamble.
@@ -85,8 +120,18 @@ public:
         IntrusiveRefCntPtr<DiagnosticsEngine> Diagnostics,
         IntrusiveRefCntPtr<llvm::vfs::FileSystem> VFS,
         std::shared_ptr<PCHContainerOperations> PCHContainerOps,
-        bool StoreInMemory, StringRef StoragePath,
+        PCHStorageMode Mode, StringRef StoragePath,
         PreambleCallbacks &Callbacks);
+
+  /// Load a PrecompiledPreamble from an existing on-disk PCH file and
+  /// previously-serialized metadata. The PCH file is hard-linked to a temp
+  /// path so the original cache entry survives session cleanup.
+  /// Returns an error if the PCH file cannot be accessed.
+  static llvm::ErrorOr<PrecompiledPreamble>
+  LoadFromFile(StringRef PCHPath, std::vector<char> PreambleBytes,
+               bool PreambleEndsAtStartOfLine,
+               llvm::StringMap<PreambleFileHash> FilesInPreamble,
+               llvm::StringSet<> MissingFiles);
 
   PrecompiledPreamble(PrecompiledPreamble &&);
   PrecompiledPreamble &operator=(PrecompiledPreamble &&);
@@ -99,6 +144,10 @@ public:
   /// For on-disk preambles returns 0 if filesystem operations fail. Intended to
   /// be used for logging and debugging purposes only.
   std::size_t getSize() const;
+
+  /// Returns the path of the on-disk PCH file, or an empty string for
+  /// in-memory preambles.
+  llvm::StringRef getFilePath() const;
 
   /// Returned string is not null-terminated.
   llvm::StringRef getContents() const {
@@ -136,35 +185,6 @@ private:
                       bool PreambleEndsAtStartOfLine,
                       llvm::StringMap<PreambleFileHash> FilesInPreamble,
                       llvm::StringSet<> MissingFiles);
-
-  /// Data used to determine if a file used in the preamble has been changed.
-  struct PreambleFileHash {
-    /// All files have size set.
-    off_t Size = 0;
-
-    /// Modification time is set for files that are on disk.  For memory
-    /// buffers it is zero.
-    time_t ModTime = 0;
-
-    /// Memory buffers have MD5 instead of modification time.  We don't
-    /// compute MD5 for on-disk files because we hope that modification time is
-    /// enough to tell if the file was changed.
-    llvm::MD5::MD5Result MD5 = {};
-
-    static PreambleFileHash createForFile(off_t Size, time_t ModTime);
-    static PreambleFileHash
-    createForMemoryBuffer(const llvm::MemoryBufferRef &Buffer);
-
-    friend bool operator==(const PreambleFileHash &LHS,
-                           const PreambleFileHash &RHS) {
-      return LHS.Size == RHS.Size && LHS.ModTime == RHS.ModTime &&
-             LHS.MD5 == RHS.MD5;
-    }
-    friend bool operator!=(const PreambleFileHash &LHS,
-                           const PreambleFileHash &RHS) {
-      return !(LHS == RHS);
-    }
-  };
 
   /// Helper function to set up PCH for the preamble into \p CI and \p VFS to
   /// with the specified \p Bounds.

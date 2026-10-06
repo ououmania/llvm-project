@@ -37,6 +37,9 @@ class FileEntry;
 class Preprocessor;
 class PPCallbacks;
 class FileManager;
+namespace clangd {
+class PreambleCache;
+} // namespace clangd
 
 namespace include_cleaner {
 
@@ -49,6 +52,7 @@ namespace include_cleaner {
 /// defines the symbol.
 class PragmaIncludes {
 public:
+  friend class clang::clangd::PreambleCache;
   /// Installs an analysing PPCallback and CommentHandler and populates results
   /// to the structure.
   void record(const CompilerInstance &CI);

@@ -246,7 +246,8 @@ public:
   bool buildAST() {
     log("Building preamble...");
     Preamble = buildPreamble(
-        File, *Invocation, Inputs, /*StoreInMemory=*/true,
+        File, *Invocation, Inputs,
+        PrecompiledPreamble::PCHStorageMode::InMemory,
         [&](CapturedASTCtx Ctx,
             std::shared_ptr<const include_cleaner::PragmaIncludes> PI) {
           if (!Opts.BuildDynamicSymbolIndex)
