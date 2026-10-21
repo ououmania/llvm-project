@@ -14,6 +14,7 @@
 #include "Hover.h"
 #include "ParsedAST.h"
 #include "Preamble.h"
+#include "PreambleCache.h"
 #include "Protocol.h"
 #include "SourceCode.h"
 #include "TestFS.h"
@@ -24,10 +25,14 @@
 #include "clang/Format/Format.h"
 #include "clang/Frontend/FrontendActions.h"
 #include "clang/Frontend/PrecompiledPreamble.h"
+#include "llvm/ADT/ScopeExit.h"
+#include "llvm/ADT/StringExtras.h"
 #include "llvm/ADT/StringMap.h"
 #include "llvm/ADT/StringRef.h"
 #include "llvm/Support/Error.h"
+#include "llvm/Support/FileSystem.h"
 #include "llvm/Support/MemoryBuffer.h"
+#include "llvm/Support/Path.h"
 #include "llvm/Support/ScopedPrinter.h"
 #include "llvm/Support/VirtualFileSystem.h"
 #include "llvm/Testing/Annotations/Annotations.h"
@@ -182,7 +187,7 @@ TEST(PreamblePatchTest, PatchesPreambleIncludes) {
   TU.AdditionalFiles["c.h"] = "";
   auto PI = TU.inputs(FS);
   auto BaselinePreamble = buildPreamble(
-      TU.Filename, *buildCompilerInvocation(PI, Diags), PI, true, nullptr);
+      TU.Filename, *buildCompilerInvocation(PI, Diags), PI, PrecompiledPreamble::PCHStorageMode::InMemory, nullptr);
   // We drop c.h from modified and add a new header. Since the latter is patched
   // we should only get a.h in preamble includes. d.h shouldn't be part of the
   // preamble, as it's coming from a disabled region.
@@ -884,6 +889,112 @@ TEST(PreamblePatch, PatchFileEntry) {
     EXPECT_THAT(FE->getName().str(),
                 testing::EndsWith(PreamblePatch::HeaderName.str()));
   }
+}
+
+TEST(PreambleCache, StoreLoadRoundTrip) {
+  // Build a preamble, store it to a persistent cache, load it back,
+  // and verify the restored PreambleData can be used without crashing
+  // (in particular PreamblePatch::apply must not crash on null TargetOpts).
+  auto TU = TestTU::withCode(R"cpp(
+    #include "a.h"
+    int main() {}
+  )cpp");
+  TU.AdditionalFiles["a.h"] = "#pragma once\nint a_var;\n";
+  MockFS FS;
+  auto PI = TU.inputs(FS);
+  IgnoreDiagnostics Diags;
+  auto CI = buildCompilerInvocation(PI, Diags);
+  ASSERT_TRUE(CI);
+
+  auto Preamble = buildPreamble(
+      TU.Filename, *CI, PI,
+      PrecompiledPreamble::PCHStorageMode::InMemory, nullptr);
+  ASSERT_TRUE(Preamble);
+  EXPECT_FALSE(Preamble->Marks.empty() && Preamble->Includes.allHeaders().empty()
+               && Preamble->Macros.Names.empty());
+
+  // Verify TargetOpts is set.
+  ASSERT_NE(Preamble->TargetOpts, nullptr);
+
+  // Verify PreamblePatch::apply doesn't crash with a proper PreambleData.
+  auto Patch = PreamblePatch::unmodified(*Preamble);
+  auto CI2 = buildCompilerInvocation(PI, Diags);
+  ASSERT_TRUE(CI2);
+  Patch.apply(*CI2); // Must not crash.
+}
+
+// A preamble restored from the persistent cache must be rejected when one of
+// its headers changed. This needs FilesInPreamble to survive the round trip;
+// when it was dropped CanReuse() accepted stale PCHs and clang later failed
+// with err_fe_ast_file_modified.
+TEST(PreambleCache, RestoredPreambleDetectsChangedHeader) {
+  llvm::SmallString<256> Root;
+  ASSERT_FALSE(llvm::sys::fs::createUniqueDirectory("preamble-cache", Root));
+  auto Cleanup =
+      llvm::scope_exit([&] { llvm::sys::fs::remove_directories(Root); });
+  PreambleCache Cache(Root);
+
+  auto TU = TestTU::withCode(R"cpp(
+    #include "a.h"
+    int main() {}
+  )cpp");
+  TU.AdditionalFiles["a.h"] = "#pragma once\nint a_var;\n";
+  MockFS FS;
+  auto PI = TU.inputs(FS);
+  IgnoreDiagnostics Diags;
+  auto CI = buildCompilerInvocation(PI, Diags);
+  ASSERT_TRUE(CI);
+
+  std::string PCHPath = Cache.stablePath(TU.Filename, PI.CompileCommand);
+  ASSERT_FALSE(llvm::sys::fs::create_directories(
+      llvm::sys::path::parent_path(PCHPath)));
+  auto Built = buildPreamble(
+      TU.Filename, *CI, PI,
+      PrecompiledPreamble::PCHStorageMode::PersistentFile, nullptr,
+      /*Stats=*/nullptr, PCHPath);
+  ASSERT_TRUE(Built);
+  std::vector<std::string> Recorded;
+  for (llvm::StringRef F : Built->Preamble.getFilesInPreamble().keys())
+    Recorded.push_back(F.str());
+  EXPECT_THAT(Recorded, testing::Contains(testing::EndsWith("a.h")));
+
+  PreambleCache::PreambleMeta Meta;
+  Meta.PreambleBytes.assign(Built->Preamble.getContents().begin(),
+                            Built->Preamble.getContents().end());
+  Meta.PreambleEndsAtStartOfLine =
+      Built->Preamble.getBounds().PreambleEndsAtStartOfLine;
+  Meta.FilesInPreamble = Built->Preamble.getFilesInPreamble();
+  Meta.MissingFiles = Built->Preamble.getMissingFiles();
+  Meta.Includes = Built->Includes;
+  Meta.Macros = Built->Macros;
+  Meta.Marks = Built->Marks;
+  ASSERT_FALSE(
+      static_cast<bool>(Cache.storeMeta(TU.Filename, PI.CompileCommand, Meta)));
+
+  auto Loaded = Cache.load(TU.Filename, PI.CompileCommand);
+  ASSERT_TRUE(static_cast<bool>(Loaded)) << llvm::toString(Loaded.takeError());
+  EXPECT_FALSE(Loaded->FilesInPreamble.empty());
+  auto Restored = PrecompiledPreamble::LoadFromFile(
+      PCHPath, std::move(Loaded->PreambleBytes),
+      Loaded->PreambleEndsAtStartOfLine, std::move(Loaded->FilesInPreamble),
+      std::move(Loaded->MissingFiles));
+  ASSERT_TRUE(static_cast<bool>(Restored));
+
+  auto Buffer = llvm::MemoryBuffer::getMemBuffer(PI.Contents, TU.Filename);
+  auto Bounds = computePreambleBounds(CI->getLangOpts(), *Buffer,
+                                      /*MaxLines=*/0);
+  auto VFS = FS.view(std::nullopt);
+  EXPECT_TRUE(
+      Restored->CanReuse(*CI, Buffer->getMemBufferRef(), Bounds, *VFS));
+
+  // Same path, different size: the header changed since the PCH was built.
+  FS.Files["a.h"] = "#pragma once\nint a_var;\nint another_var;\n";
+  auto ChangedVFS = FS.view(std::nullopt);
+  std::string Reason;
+  EXPECT_FALSE(Restored->CanReuse(*CI, Buffer->getMemBufferRef(), Bounds,
+                                  *ChangedVFS, &Reason));
+  EXPECT_THAT(Reason, testing::AllOf(testing::HasSubstr("a.h"),
+                                     testing::HasSubstr("size")));
 }
 
 } // namespace

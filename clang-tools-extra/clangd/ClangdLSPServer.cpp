@@ -29,12 +29,14 @@
 #include "llvm/ADT/ArrayRef.h"
 #include "llvm/ADT/FunctionExtras.h"
 #include "llvm/ADT/ScopeExit.h"
+#include "llvm/ADT/StringExtras.h"
 #include "llvm/ADT/StringRef.h"
 #include "llvm/ADT/Twine.h"
 #include "llvm/Support/Allocator.h"
 #include "llvm/Support/Error.h"
 #include "llvm/Support/FormatVariadic.h"
 #include "llvm/Support/JSON.h"
+#include "llvm/Support/MemoryBuffer.h"
 #include "llvm/Support/SHA1.h"
 #include "llvm/Support/ScopedPrinter.h"
 #include "llvm/Support/raw_ostream.h"
@@ -75,6 +77,7 @@ std::optional<int64_t> decodeVersion(llvm::StringRef Encoded) {
 const llvm::StringLiteral ApplyFixCommand = "clangd.applyFix";
 const llvm::StringLiteral ApplyTweakCommand = "clangd.applyTweak";
 const llvm::StringLiteral ApplyRenameCommand = "clangd.applyRename";
+const llvm::StringLiteral PrewarmPreamblesCommand = "clangd.prewarmPreambles";
 
 CodeAction toCodeAction(const ClangdServer::CodeActionResult::Rename &R,
                         const URIForFile &File) {
@@ -803,6 +806,27 @@ void ClangdLSPServer::onCommandApplyEdit(const WorkspaceEdit &WE,
   // 6. The editor applies the changes (applyEdit), and sends us a reply
   // 7. We unwrap the reply and send a reply to the editor.
   applyEdit(WE, "Fix applied.", std::move(Reply));
+}
+
+// The argument is the path of a text file listing one absolute source path
+// per line (blank lines and lines starting with '#' are ignored).
+void ClangdLSPServer::onCommandPrewarmPreambles(
+    const std::string &ListPath, Callback<llvm::json::Value> Reply) {
+  auto Buf = llvm::MemoryBuffer::getFile(ListPath);
+  if (!Buf)
+    return Reply(error(Buf.getError(), "cannot read prewarm list {0}",
+                       ListPath));
+  std::vector<Path> Files;
+  for (llvm::StringRef Line : llvm::split((*Buf)->getBuffer(), '\n')) {
+    Line = Line.trim();
+    if (!Line.empty() && !Line.starts_with("#"))
+      Files.push_back(Line.str());
+  }
+  auto Result = Server->prewarmPreambles(Files);
+  if (!Result)
+    return Reply(Result.takeError());
+  Reply(llvm::json::Object{{"queued", Result->Queued},
+                           {"skipped", Result->Skipped}});
 }
 
 void ClangdLSPServer::onCommandApplyTweak(const TweakArgs &Args,
@@ -1733,6 +1757,8 @@ void ClangdLSPServer::bindMethods(LSPBinder &Bind,
   Bind.method("textDocument/foldingRange", this, &ClangdLSPServer::onFoldingRange);
   Bind.command(ApplyFixCommand, this, &ClangdLSPServer::onCommandApplyEdit);
   Bind.command(ApplyTweakCommand, this, &ClangdLSPServer::onCommandApplyTweak);
+  Bind.command(PrewarmPreamblesCommand, this,
+               &ClangdLSPServer::onCommandPrewarmPreambles);
   Bind.command(ApplyRenameCommand, this, &ClangdLSPServer::onCommandApplyRename);
 
   ApplyWorkspaceEdit = Bind.outgoingMethod("workspace/applyEdit");

@@ -375,7 +375,7 @@ TEST(ParsedASTTest, PatchesAdditionalIncludes) {
   auto Inputs = TU.inputs(FS);
   auto CI = buildCompilerInvocation(Inputs, Diags);
   auto EmptyPreamble =
-      buildPreamble(testPath("foo.cpp"), *CI, Inputs, true, nullptr);
+      buildPreamble(testPath("foo.cpp"), *CI, Inputs, PrecompiledPreamble::PCHStorageMode::InMemory, nullptr);
   ASSERT_TRUE(EmptyPreamble);
   EXPECT_THAT(EmptyPreamble->Includes.MainFileIncludes, IsEmpty());
 
@@ -417,7 +417,7 @@ TEST(ParsedASTTest, PatchesDeletedIncludes) {
   auto Inputs = TU.inputs(FS);
   auto CI = buildCompilerInvocation(Inputs, Diags);
   auto BaselinePreamble =
-      buildPreamble(testPath("foo.cpp"), *CI, Inputs, true, nullptr);
+      buildPreamble(testPath("foo.cpp"), *CI, Inputs, PrecompiledPreamble::PCHStorageMode::InMemory, nullptr);
   ASSERT_TRUE(BaselinePreamble);
   EXPECT_THAT(BaselinePreamble->Includes.MainFileIncludes,
               ElementsAre(testing::Field(&Inclusion::Written, "<foo.h>")));

@@ -109,7 +109,7 @@ TestTU::preamble(PreambleParsedCallback PreambleCallback) const {
   llvm::scope_exit ModuleCacheDeleter(
       std::bind(deleteModuleCache, CI->getHeaderSearchOpts().ModuleCachePath));
   return clang::clangd::buildPreamble(testPath(Filename), *CI, Inputs,
-                                      /*StoreInMemory=*/true, PreambleCallback);
+                                      PrecompiledPreamble::PCHStorageMode::InMemory, PreambleCallback);
 }
 
 ParsedAST TestTU::build() const {
@@ -125,7 +125,7 @@ ParsedAST TestTU::build() const {
       std::bind(deleteModuleCache, CI->getHeaderSearchOpts().ModuleCachePath));
 
   auto Preamble = clang::clangd::buildPreamble(testPath(Filename), *CI, Inputs,
-                                               /*StoreInMemory=*/true,
+                                               PrecompiledPreamble::PCHStorageMode::InMemory,
                                                /*PreambleCallback=*/nullptr);
   auto AST = ParsedAST::build(testPath(Filename), Inputs, std::move(CI),
                               Diags.take(), Preamble);

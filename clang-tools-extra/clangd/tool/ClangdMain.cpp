@@ -16,6 +16,7 @@
 #include "FeatureModule.h"
 #include "IncludeCleaner.h"
 #include "PathMapping.h"
+#include "PreambleCache.h"
 #include "Protocol.h"
 #include "TidyProvider.h"
 #include "Transport.h"
@@ -404,6 +405,24 @@ opt<PCHStorageFlag> PCHStorage{
         clEnumValN(PCHStorageFlag::Disk, "disk", "store PCHs on disk"),
         clEnumValN(PCHStorageFlag::Memory, "memory", "store PCHs in memory")),
     init(PCHStorageFlag::Disk),
+};
+
+opt<std::string> PreambleCacheSize{
+    "preamble-cache-size",
+    cat(Misc),
+    desc("Enable persistent preamble PCH cache with the given disk cap. "
+         "Accepts K/M/G suffixes (e.g. 10G). Disabled by default (empty)."),
+    init(""),
+};
+
+opt<unsigned> MaxRetainedASTs{
+    "max-retained-asts",
+    cat(Misc),
+    desc("Maximum number of idle ASTs to retain in memory. Retaining more "
+         "avoids rebuilding ASTs when switching between files, at the cost of "
+         "memory. ASTs in use by a request are not counted against this "
+         "limit. Zero disables caching of idle ASTs"),
+    init(ASTRetentionPolicy().MaxRetainedASTs),
 };
 
 opt<bool> Sync{
@@ -943,6 +962,32 @@ clangd accepts flags on the commandline, and in the CLANGD_FLAGS environment var
     Opts.StorePreamblesInMemory = false;
     break;
   }
+
+  // Set up persistent preamble cache.
+  // Only enabled when --preamble-cache-size is explicitly specified with a
+  // non-zero value and PCH storage mode is disk (not in-memory).
+  std::optional<PreambleCache> PreambleDiskCache;
+  if (!Opts.StorePreamblesInMemory && !PreambleCacheSize.empty()) {
+    uint64_t CacheBytes = 0;
+    llvm::StringRef SizeStr = PreambleCacheSize;
+    uint64_t Multiplier = 1;
+    if (SizeStr.consume_back_insensitive("G"))
+      Multiplier = 1024ULL * 1024 * 1024;
+    else if (SizeStr.consume_back_insensitive("M"))
+      Multiplier = 1024ULL * 1024;
+    else if (SizeStr.consume_back_insensitive("K"))
+      Multiplier = 1024ULL;
+    uint64_t Num = 0;
+    if (!SizeStr.getAsInteger(10, Num))
+      CacheBytes = Num * Multiplier;
+    if (CacheBytes > 0) {
+      PreambleDiskCache.emplace("", CacheBytes);
+      Opts.PreambleDiskCache = &*PreambleDiskCache;
+      log("Persistent preamble cache enabled (max {0} bytes)", CacheBytes);
+    }
+  }
+
+  Opts.RetentionPolicy.MaxRetainedASTs = MaxRetainedASTs;
   if (!ResourceDir.empty())
     Opts.ResourceDir = ResourceDir;
   Opts.StrongWorkspaceMode = StrongWorkspaceMode;

@@ -48,95 +48,8 @@ class PreambleCallbacks;
 /// CanReusePreamble + AddImplicitPreamble to make use of it.
 class PrecompiledPreamble {
   class PCHStorage;
-  struct PreambleFileHash;
 
 public:
-  /// Try to build PrecompiledPreamble for \p Invocation. See
-  /// BuildPreambleError for possible error codes.
-  ///
-  /// \param Invocation Original CompilerInvocation with options to compile the
-  /// file.
-  ///
-  /// \param MainFileBuffer Buffer with the contents of the main file.
-  ///
-  /// \param Bounds Bounds of the preamble, result of calling
-  /// ComputePreambleBounds.
-  ///
-  /// \param Diagnostics Diagnostics engine to be used while building the
-  /// preamble.
-  ///
-  /// \param VFS An instance of vfs::FileSystem to be used for file
-  /// accesses.
-  ///
-  /// \param PCHContainerOps An instance of PCHContainerOperations.
-  ///
-  /// \param StoreInMemory Store PCH in memory. If false, PCH will be stored in
-  /// a temporary file.
-  ///
-  /// \param StoragePath The path to a directory, in which to create a temporary
-  /// file to store PCH in. If empty, the default system temporary directory is
-  /// used. This parameter is ignored if \p StoreInMemory is true.
-  ///
-  /// \param Callbacks A set of callbacks to be executed when building
-  /// the preamble.
-  static llvm::ErrorOr<PrecompiledPreamble>
-  Build(const CompilerInvocation &Invocation,
-        const llvm::MemoryBuffer *MainFileBuffer, PreambleBounds Bounds,
-        IntrusiveRefCntPtr<DiagnosticsEngine> Diagnostics,
-        IntrusiveRefCntPtr<llvm::vfs::FileSystem> VFS,
-        std::shared_ptr<PCHContainerOperations> PCHContainerOps,
-        bool StoreInMemory, StringRef StoragePath,
-        PreambleCallbacks &Callbacks);
-
-  PrecompiledPreamble(PrecompiledPreamble &&);
-  PrecompiledPreamble &operator=(PrecompiledPreamble &&);
-  ~PrecompiledPreamble();
-
-  /// PreambleBounds used to build the preamble.
-  PreambleBounds getBounds() const;
-
-  /// Returns the size, in bytes, that preamble takes on disk or in memory.
-  /// For on-disk preambles returns 0 if filesystem operations fail. Intended to
-  /// be used for logging and debugging purposes only.
-  std::size_t getSize() const;
-
-  /// Returned string is not null-terminated.
-  llvm::StringRef getContents() const {
-    return {PreambleBytes.data(), PreambleBytes.size()};
-  }
-
-  /// Check whether PrecompiledPreamble can be reused for the new contents(\p
-  /// MainFileBuffer) of the main file.
-  bool CanReuse(const CompilerInvocation &Invocation,
-                const llvm::MemoryBufferRef &MainFileBuffer,
-                PreambleBounds Bounds, llvm::vfs::FileSystem &VFS) const;
-
-  /// Changes options inside \p CI to use PCH from this preamble. Also remaps
-  /// main file to \p MainFileBuffer and updates \p VFS to ensure the preamble
-  /// is accessible.
-  /// Requires that CanReuse() is true.
-  /// For in-memory preambles, PrecompiledPreamble instance continues to own the
-  /// MemoryBuffer with the Preamble after this method returns. The caller is
-  /// responsible for making sure the PrecompiledPreamble instance outlives the
-  /// compiler run and the AST that will be using the PCH.
-  void AddImplicitPreamble(CompilerInvocation &CI,
-                           IntrusiveRefCntPtr<llvm::vfs::FileSystem> &VFS,
-                           llvm::MemoryBuffer *MainFileBuffer) const;
-
-  /// Configure \p CI to use this preamble.
-  /// Like AddImplicitPreamble, but doesn't assume CanReuse() is true.
-  /// If this preamble does not match the file, it may parse differently.
-  void OverridePreamble(CompilerInvocation &CI,
-                        IntrusiveRefCntPtr<llvm::vfs::FileSystem> &VFS,
-                        llvm::MemoryBuffer *MainFileBuffer) const;
-
-private:
-  PrecompiledPreamble(std::unique_ptr<PCHStorage> Storage,
-                      std::vector<char> PreambleBytes,
-                      bool PreambleEndsAtStartOfLine,
-                      llvm::StringMap<PreambleFileHash> FilesInPreamble,
-                      llvm::StringSet<> MissingFiles);
-
   /// Data used to determine if a file used in the preamble has been changed.
   struct PreambleFileHash {
     /// All files have size set.
@@ -165,6 +78,128 @@ private:
       return !(LHS == RHS);
     }
   };
+
+  /// Controls where the PCH data is stored.
+  enum class PCHStorageMode {
+    InMemory,       ///< PCH stored in memory.
+    TempFile,       ///< PCH stored in a temporary file (deleted on destruction).
+    PersistentFile, ///< PCH stored at a stable path (survives destruction).
+  };
+
+  /// Try to build PrecompiledPreamble for \p Invocation. See
+  /// BuildPreambleError for possible error codes.
+  ///
+  /// \param Invocation Original CompilerInvocation with options to compile the
+  /// file.
+  ///
+  /// \param MainFileBuffer Buffer with the contents of the main file.
+  ///
+  /// \param Bounds Bounds of the preamble, result of calling
+  /// ComputePreambleBounds.
+  ///
+  /// \param Diagnostics Diagnostics engine to be used while building the
+  /// preamble.
+  ///
+  /// \param VFS An instance of vfs::FileSystem to be used for file
+  /// accesses.
+  ///
+  /// \param PCHContainerOps An instance of PCHContainerOperations.
+  ///
+  /// \param Mode Controls where the PCH is stored: in memory, a temporary
+  /// file, or a persistent file.
+  ///
+  /// \param StoragePath For TempFile mode: directory for the temporary file
+  /// (empty uses system temp). For PersistentFile mode: the exact output file
+  /// path. Ignored for InMemory mode.
+  ///
+  /// \param Callbacks A set of callbacks to be executed when building
+  /// the preamble.
+  static llvm::ErrorOr<PrecompiledPreamble>
+  Build(const CompilerInvocation &Invocation,
+        const llvm::MemoryBuffer *MainFileBuffer, PreambleBounds Bounds,
+        IntrusiveRefCntPtr<DiagnosticsEngine> Diagnostics,
+        IntrusiveRefCntPtr<llvm::vfs::FileSystem> VFS,
+        std::shared_ptr<PCHContainerOperations> PCHContainerOps,
+        PCHStorageMode Mode, StringRef StoragePath,
+        PreambleCallbacks &Callbacks);
+
+  /// Load a PrecompiledPreamble from an existing on-disk PCH file and
+  /// previously-serialized metadata. The PCH file is hard-linked to a temp
+  /// path so the original cache entry survives session cleanup.
+  /// Returns an error if the PCH file cannot be accessed.
+  static llvm::ErrorOr<PrecompiledPreamble>
+  LoadFromFile(StringRef PCHPath, std::vector<char> PreambleBytes,
+               bool PreambleEndsAtStartOfLine,
+               llvm::StringMap<PreambleFileHash> FilesInPreamble,
+               llvm::StringSet<> MissingFiles);
+
+  PrecompiledPreamble(PrecompiledPreamble &&);
+  PrecompiledPreamble &operator=(PrecompiledPreamble &&);
+  ~PrecompiledPreamble();
+
+  /// PreambleBounds used to build the preamble.
+  PreambleBounds getBounds() const;
+
+  /// Returns the size, in bytes, that preamble takes on disk or in memory.
+  /// For on-disk preambles returns 0 if filesystem operations fail. Intended to
+  /// be used for logging and debugging purposes only.
+  std::size_t getSize() const;
+
+  /// Returns the path of the on-disk PCH file, or an empty string for
+  /// in-memory preambles.
+  llvm::StringRef getFilePath() const;
+
+  /// Returned string is not null-terminated.
+  llvm::StringRef getContents() const {
+    return {PreambleBytes.data(), PreambleBytes.size()};
+  }
+
+  /// Files that were read while building the preamble, with their size and
+  /// modification time. CanReuse() requires all of them, so this must be
+  /// preserved whenever a preamble outlives its build (e.g. one restored from
+  /// an on-disk cache).
+  const llvm::StringMap<PreambleFileHash> &getFilesInPreamble() const {
+    return FilesInPreamble;
+  }
+
+  /// Files that were not found while building the preamble. CanReuse() requires
+  /// these too; see the member declaration for why the set is limited.
+  const llvm::StringSet<> &getMissingFiles() const { return MissingFiles; }
+
+  /// Check whether PrecompiledPreamble can be reused for the new contents(\p
+  /// MainFileBuffer) of the main file. If \p Reason is non-null and the
+  /// preamble cannot be reused, it receives a description of the first
+  /// mismatch found.
+  bool CanReuse(const CompilerInvocation &Invocation,
+                const llvm::MemoryBufferRef &MainFileBuffer,
+                PreambleBounds Bounds, llvm::vfs::FileSystem &VFS,
+                std::string *Reason = nullptr) const;
+
+  /// Changes options inside \p CI to use PCH from this preamble. Also remaps
+  /// main file to \p MainFileBuffer and updates \p VFS to ensure the preamble
+  /// is accessible.
+  /// Requires that CanReuse() is true.
+  /// For in-memory preambles, PrecompiledPreamble instance continues to own the
+  /// MemoryBuffer with the Preamble after this method returns. The caller is
+  /// responsible for making sure the PrecompiledPreamble instance outlives the
+  /// compiler run and the AST that will be using the PCH.
+  void AddImplicitPreamble(CompilerInvocation &CI,
+                           IntrusiveRefCntPtr<llvm::vfs::FileSystem> &VFS,
+                           llvm::MemoryBuffer *MainFileBuffer) const;
+
+  /// Configure \p CI to use this preamble.
+  /// Like AddImplicitPreamble, but doesn't assume CanReuse() is true.
+  /// If this preamble does not match the file, it may parse differently.
+  void OverridePreamble(CompilerInvocation &CI,
+                        IntrusiveRefCntPtr<llvm::vfs::FileSystem> &VFS,
+                        llvm::MemoryBuffer *MainFileBuffer) const;
+
+private:
+  PrecompiledPreamble(std::unique_ptr<PCHStorage> Storage,
+                      std::vector<char> PreambleBytes,
+                      bool PreambleEndsAtStartOfLine,
+                      llvm::StringMap<PreambleFileHash> FilesInPreamble,
+                      llvm::StringSet<> MissingFiles);
 
   /// Helper function to set up PCH for the preamble into \p CI and \p VFS to
   /// with the specified \p Bounds.

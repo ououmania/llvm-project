@@ -186,6 +186,7 @@ public:
   static const HeaderID MainFileID = HeaderID(0u);
 
   class RecordHeaders;
+  friend class PreambleCache;
 
 private:
   // MainFileEntry will be used to check if the queried file is the main file

@@ -13,6 +13,7 @@
 #include "ConfigFragment.h"
 #include "GlobalCompilationDatabase.h"
 #include "Matchers.h"
+#include "PreambleCache.h"
 #include "SyncAPI.h"
 #include "TestFS.h"
 #include "TestTU.h"
@@ -26,12 +27,16 @@
 #include "clang/Tooling/ArgumentsAdjusters.h"
 #include "clang/Tooling/Core/Replacement.h"
 #include "llvm/ADT/ArrayRef.h"
+#include "llvm/ADT/STLExtras.h"
+#include "llvm/ADT/ScopeExit.h"
+#include "llvm/ADT/SmallString.h"
 #include "llvm/ADT/SmallVector.h"
 #include "llvm/ADT/StringMap.h"
 #include "llvm/ADT/StringRef.h"
 #include "llvm/Config/llvm-config.h" // for LLVM_ON_UNIX
 #include "llvm/Support/Allocator.h"
 #include "llvm/Support/Error.h"
+#include "llvm/Support/FileSystem.h"
 #include "llvm/Support/Path.h"
 #include "llvm/Support/Regex.h"
 #include "llvm/Support/VirtualFileSystem.h"
@@ -1359,6 +1364,61 @@ $inactive4[[  int inactiveInt3;]]
               ElementsAre(ElementsAre(
                   Source.range("inactive1"), Source.range("inactive2"),
                   Source.range("inactive3"), Source.range("inactive4"))));
+}
+
+unsigned countCachedPCHs(llvm::StringRef Root) {
+  unsigned Count = 0;
+  std::error_code EC;
+  for (llvm::sys::fs::recursive_directory_iterator It(Root, EC), End;
+       !EC && It != End; It.increment(EC))
+    if (llvm::sys::path::extension(It->path()) == ".pch")
+      ++Count;
+  return Count;
+}
+
+TEST(ClangdServerTest, PrewarmPreamblesBuildsAllFiles) {
+  llvm::SmallString<256> Root;
+  ASSERT_FALSE(llvm::sys::fs::createUniqueDirectory("prewarm-cache", Root));
+  auto Cleanup =
+      llvm::scope_exit([&] { llvm::sys::fs::remove_directories(Root); });
+  PreambleCache Cache(Root);
+
+  MockFS FS;
+  MockCompilationDatabase CDB;
+  auto Opts = ClangdServer::optsForTest();
+  Opts.StorePreamblesInMemory = false;
+  Opts.PreambleDiskCache = &Cache;
+  ClangdServer Server(CDB, FS, Opts);
+
+  FS.Files[testPath("foo.h")] = "int a;";
+  for (llvm::StringRef Name : {"a.cpp", "b.cpp", "open.cpp"})
+    FS.Files[testPath(Name)] = "#include \"foo.h\"\nint x = a;";
+
+  // Only open.cpp was opened; a.cpp and b.cpp have no cache entry.
+  Server.addDocument(testPath("open.cpp"), FS.Files[testPath("open.cpp")]);
+  ASSERT_TRUE(Server.blockUntilIdleForTest());
+  unsigned Before = countCachedPCHs(Root);
+  ASSERT_EQ(Before, 1u);
+
+  // Prewarm all three including never-opened files.
+  auto Result = Server.prewarmPreambles(
+      {testPath("a.cpp"), testPath("b.cpp"), testPath("a.cpp"),
+       testPath("open.cpp"), "relative.cpp"});
+  ASSERT_TRUE(static_cast<bool>(Result)) << llvm::toString(Result.takeError());
+  EXPECT_EQ(Result->Queued, 2u);  // a.cpp, b.cpp (open.cpp & dup & relative skipped)
+  EXPECT_EQ(Result->Skipped, 3u);
+  ASSERT_TRUE(Server.blockUntilIdleForTest());
+  // Both never-opened files now have PCH entries.
+  EXPECT_EQ(countCachedPCHs(Root), Before + 2);
+}
+
+TEST(ClangdServerTest, PrewarmPreamblesRequiresPersistentCache) {
+  MockFS FS;
+  MockCompilationDatabase CDB;
+  ClangdServer Server(CDB, FS, ClangdServer::optsForTest());
+  auto Result = Server.prewarmPreambles({testPath("a.cpp")});
+  EXPECT_FALSE(static_cast<bool>(Result));
+  llvm::consumeError(Result.takeError());
 }
 
 } // namespace

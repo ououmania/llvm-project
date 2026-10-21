@@ -338,7 +338,7 @@ TEST(FileIndexTest, RebuildWithPreamble) {
   bool IndexUpdated = false;
   buildPreamble(
       FooCpp, *CI, PI,
-      /*StoreInMemory=*/true,
+      PrecompiledPreamble::PCHStorageMode::InMemory,
       [&](CapturedASTCtx ASTCtx,
           std::shared_ptr<const include_cleaner::PragmaIncludes> PI) {
         auto &Ctx = ASTCtx.getASTContext();

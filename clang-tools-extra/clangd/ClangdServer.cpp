@@ -43,11 +43,14 @@
 #include "llvm/ADT/ArrayRef.h"
 #include "llvm/ADT/STLExtras.h"
 #include "llvm/ADT/StringRef.h"
+#include "llvm/ADT/StringSet.h"
 #include "llvm/Support/Error.h"
 #include "llvm/Support/Path.h"
 #include "llvm/Support/raw_ostream.h"
 #include <algorithm>
 #include <chrono>
+#include <condition_variable>
+#include <deque>
 #include <future>
 #include <memory>
 #include <mutex>
@@ -192,6 +195,166 @@ private:
 
 } // namespace
 
+// Builds preambles for files that are not open in the editor, using a private
+// TUScheduler so that they never interfere with the files the user is working
+// on. Results land in the persistent preamble cache.
+class ClangdServer::PreambleWarmer {
+public:
+  using MakeInputsFn = std::function<ParseInputs(PathRef, llvm::StringRef)>;
+
+  PreambleWarmer(const GlobalCompilationDatabase &CDB, const ThreadsafeFS &TFS,
+                 const DraftStore &Drafts, TUScheduler::Options Opts,
+                 MakeInputsFn MakeInputs)
+      : CDB(CDB), TFS(TFS), Drafts(Drafts), Opts(std::move(Opts)),
+        MakeInputs(std::move(MakeInputs)) {
+    // Keep resource usage low: the user's own files take priority.
+    if (this->Opts.AsyncThreadsCount != 0)
+      this->Opts.AsyncThreadsCount = Parallelism;
+    this->Opts.UpdateDebounce = DebouncePolicy::fixed({});
+    this->Opts.RetentionPolicy.MaxRetainedASTs = 0;
+  }
+
+  ~PreambleWarmer() {
+    {
+      std::lock_guard<std::mutex> Lock(Mu);
+      Stop = true;
+      Queue.clear();
+    }
+    CV.notify_all();
+    Driver.wait();
+  }
+
+  bool blockUntilIdle(Deadline D) {
+    std::unique_lock<std::mutex> Lock(Mu);
+    return wait(Lock, CV, D, [&] { return !Running; });
+  }
+
+  /// Returns the number of files that were not already pending.
+  unsigned enqueue(llvm::ArrayRef<Path> Files) {
+    unsigned Added = 0;
+    bool Spawn = false;
+    {
+      std::lock_guard<std::mutex> Lock(Mu);
+      for (const Path &File : Files)
+        if (Pending.insert(File).second) {
+          Queue.push_back(File);
+          ++Added;
+        }
+      if (Added && !Running)
+        Running = Spawn = true;
+    }
+    if (Spawn)
+      Driver.runAsync("PreambleWarmer", [this] { run(); });
+    else if (Added)
+      CV.notify_all();
+    return Added;
+  }
+
+  /// Remove \p File from the queue if it has not started building yet.
+  /// Called when the user opens a file, so the main TUScheduler owns it.
+  void cancel(PathRef File) {
+    std::lock_guard<std::mutex> Lock(Mu);
+    if (!Pending.count(File))
+      return;
+    auto It = llvm::find(Queue, File);
+    if (It != Queue.end()) {
+      Queue.erase(It);
+      Pending.erase(File);
+    }
+  }
+
+private:
+  static constexpr unsigned Parallelism = 2;
+
+  // TUScheduler is not thread-safe: only this thread may use Scheduler.
+  void run() {
+    WithContext Fresh(Context::empty());
+    unsigned Started = 0;
+    {
+      TUScheduler Scheduler(CDB, Opts);
+      std::unique_lock<std::mutex> Lock(Mu);
+      while (!Stop) {
+        if (!Finished.empty()) {
+          std::vector<Path> Batch = std::move(Finished);
+          Finished.clear();
+          Lock.unlock();
+          for (const Path &File : Batch)
+            Scheduler.remove(File);
+          Lock.lock();
+          for (const Path &File : Batch)
+            Pending.erase(File);
+          InFlight -= Batch.size();
+          continue;
+        }
+        if (!Queue.empty() && InFlight < Parallelism) {
+          Path File = std::move(Queue.front());
+          Queue.pop_front();
+          ++InFlight;
+          Lock.unlock();
+          bool Ok = start(Scheduler, File);
+          Lock.lock();
+          if (Ok) {
+            ++Started;
+          } else {
+            --InFlight;
+            Pending.erase(File);
+          }
+          continue;
+        }
+        if (Queue.empty() && InFlight == 0)
+          break;
+        CV.wait(Lock);
+      }
+      Running = false;
+      // In-flight callbacks need Mu while Scheduler drains in its destructor.
+      Lock.unlock();
+      CV.notify_all();
+    }
+    log("PreambleCache: prewarm finished ({0} files processed)", Started);
+  }
+
+  bool start(TUScheduler &Scheduler, PathRef File) {
+    // The user opened it meanwhile; its own ASTWorker owns the cache entry.
+    if (Drafts.getDraft(File))
+      return false;
+    auto Buf = TFS.view(std::nullopt)->getBufferForFile(File);
+    if (!Buf) {
+      vlog("PreambleCache: prewarm cannot read {0}: {1}", File,
+           Buf.getError().message());
+      return false;
+    }
+    Scheduler.update(File, MakeInputs(File, (*Buf)->getBuffer()),
+                     WantDiagnostics::No);
+    Scheduler.runWithPreamble(
+        "PrewarmPreamble", File, TUScheduler::Stale,
+        [this, File = File.str()](llvm::Expected<InputsAndPreamble> R) {
+          if (!R)
+            elog("PreambleCache: prewarm of {0} failed: {1}", File,
+                 R.takeError());
+          std::lock_guard<std::mutex> Lock(Mu);
+          Finished.push_back(File);
+          CV.notify_all();
+        });
+    return true;
+  }
+
+  const GlobalCompilationDatabase &CDB;
+  const ThreadsafeFS &TFS;
+  const DraftStore &Drafts;
+  TUScheduler::Options Opts;
+  MakeInputsFn MakeInputs;
+
+  std::mutex Mu;
+  std::condition_variable CV;
+  std::deque<Path> Queue;       // GUARDED_BY(Mu); not started yet.
+  llvm::StringSet<> Pending;    // GUARDED_BY(Mu); queued or in flight.
+  std::vector<Path> Finished;   // GUARDED_BY(Mu); awaiting Scheduler.remove().
+  unsigned InFlight = 0;        // GUARDED_BY(Mu)
+  bool Running = false;         // GUARDED_BY(Mu)
+  bool Stop = false;            // GUARDED_BY(Mu)
+  AsyncTaskRunner Driver;       // Last: joined before the state above dies.
+};
+
 ClangdServer::Options ClangdServer::optsForTest() {
   ClangdServer::Options Opts;
   Opts.UpdateDebounce = DebouncePolicy::fixed(/*zero*/ {});
@@ -208,6 +371,7 @@ ClangdServer::Options::operator TUScheduler::Options() const {
   Opts.UpdateDebounce = UpdateDebounce;
   Opts.ContextProvider = ContextProvider;
   Opts.PreambleThrottler = PreambleThrottler;
+  Opts.PreambleDiskCache = PreambleDiskCache;
   return Opts;
 }
 
@@ -230,7 +394,8 @@ ClangdServer::ClangdServer(const GlobalCompilationDatabase &CDB,
       Transient(Opts.ImplicitCancellation ? TUScheduler::InvalidateOnUpdate
                                           : TUScheduler::NoInvalidation),
       DirtyFS(std::make_unique<DraftStoreFS>(TFS, DraftMgr)),
-      ContextProvider(Opts.ContextProvider) {
+      ContextProvider(Opts.ContextProvider),
+      PrewarmOpts(Opts) {
   if (Opts.AsyncThreadsCount != 0)
     IndexTasks.emplace();
   // Pass a callback into `WorkScheduler` to extract symbols from a newly
@@ -286,6 +451,7 @@ ClangdServer::~ClangdServer() {
   // Destroying TUScheduler first shuts down request threads that might
   // otherwise access members concurrently.
   // (Nobody can be using TUScheduler because we're on the main thread).
+  Warmer.reset();
   WorkScheduler.reset();
   // Now requests have stopped, we can shut down feature modules.
   if (FeatureModules) {
@@ -299,25 +465,14 @@ ClangdServer::~ClangdServer() {
 void ClangdServer::addDocument(PathRef File, llvm::StringRef Contents,
                                llvm::StringRef Version,
                                WantDiagnostics WantDiags, bool ForceRebuild) {
+  if (Warmer)
+    Warmer->cancel(File);
   bool NewModule = ModulesManager && ModulesManager->observeSourcePath(File);
 
   std::string ActualVersion = DraftMgr.addDraft(File, Version, Contents);
-  ParseOptions Opts;
-  Opts.PreambleParseForwardingFunctions = PreambleParseForwardingFunctions;
-  Opts.ImportInsertions = ImportInsertions;
-
   // Compile command is set asynchronously during update, as it can be slow.
-  ParseInputs Inputs;
-  Inputs.TFS = &getHeaderFS();
-  Inputs.Contents = std::string(Contents);
-  Inputs.Version = std::move(ActualVersion);
-  Inputs.ForceRebuild = ForceRebuild;
-  Inputs.Opts = std::move(Opts);
-  Inputs.Index = Index;
-  Inputs.ClangTidyProvider = ClangTidyProvider;
-  Inputs.FeatureModules = FeatureModules;
-  Inputs.ModulesManager = ModulesManager;
-  adjustParseInputs(Inputs, File);
+  ParseInputs Inputs =
+      makeParseInputs(File, Contents, ActualVersion, ForceRebuild);
   bool NewFile = WorkScheduler->update(File, Inputs, WantDiags);
   // If we loaded Foo.h, we want to make sure Foo.cpp is indexed.
   if (NewFile && BackgroundIdx)
@@ -325,6 +480,28 @@ void ClangdServer::addDocument(PathRef File, llvm::StringRef Contents,
   if (NewModule)
     reparseOpenFilesIfNeeded(
         [&](PathRef OpenFile) { return !pathEqual(OpenFile, File); });
+}
+
+ParseInputs ClangdServer::makeParseInputs(PathRef File,
+                                          llvm::StringRef Contents,
+                                          llvm::StringRef Version,
+                                          bool ForceRebuild) const {
+  ParseOptions Opts;
+  Opts.PreambleParseForwardingFunctions = PreambleParseForwardingFunctions;
+  Opts.ImportInsertions = ImportInsertions;
+
+  ParseInputs Inputs;
+  Inputs.TFS = &getHeaderFS();
+  Inputs.Contents = std::string(Contents);
+  Inputs.Version = std::string(Version);
+  Inputs.ForceRebuild = ForceRebuild;
+  Inputs.Opts = std::move(Opts);
+  Inputs.Index = Index;
+  Inputs.ClangTidyProvider = ClangTidyProvider;
+  Inputs.FeatureModules = FeatureModules;
+  Inputs.ModulesManager = ModulesManager;
+  adjustParseInputs(Inputs, File);
+  return Inputs;
 }
 
 void ClangdServer::reparseOpenFilesIfNeeded(
@@ -1166,6 +1343,8 @@ ClangdServer::blockUntilIdleForTest(std::optional<double> TimeoutSeconds) {
   // and we're blocking the main thread.
   if (!WorkScheduler->blockUntilIdle(timeoutSeconds(TimeoutSeconds)))
     return false;
+  if (Warmer && !Warmer->blockUntilIdle(timeoutSeconds(TimeoutSeconds)))
+    return false;
   // TUScheduler is the only thing that starts background indexing work.
   if (IndexTasks && !IndexTasks->wait(timeoutSeconds(TimeoutSeconds)))
     return false;
@@ -1221,6 +1400,33 @@ void ClangdServer::adjustParseInputs(ParseInputs &Inputs, PathRef File) const {
     return ModulesManager->hasRequiredModules(File);
   };
   Inputs.Opts.SkipPreambleBuild = SkipPreambleBuild || HasRequiredModules();
+}
+
+llvm::Expected<ClangdServer::PrewarmResult>
+ClangdServer::prewarmPreambles(llvm::ArrayRef<Path> Files) {
+  if (!PrewarmOpts.PreambleDiskCache || PrewarmOpts.StorePreamblesInMemory)
+    return error("the persistent preamble cache is not enabled "
+                 "(needs --pch-storage=disk and --preamble-cache-size)");
+  if (!Warmer)
+    Warmer = std::make_unique<PreambleWarmer>(
+        CDB, TFS, DraftMgr, PrewarmOpts,
+        [this](PathRef File, llvm::StringRef Contents) {
+          return makeParseInputs(File, Contents, "prewarm",
+                                 /*ForceRebuild=*/false);
+        });
+
+  std::vector<Path> Candidates;
+  for (const Path &File : Files)
+    if (llvm::sys::path::is_absolute(File) && !DraftMgr.getDraft(File))
+      Candidates.push_back(File);
+
+  PrewarmResult Result;
+  Result.Queued = Warmer->enqueue(Candidates);
+  Result.Skipped = Files.size() - Result.Queued;
+  if (Result.Queued)
+    log("PreambleCache: prewarm queued {0} files ({1} skipped)", Result.Queued,
+        Result.Skipped);
+  return Result;
 }
 
 } // namespace clangd

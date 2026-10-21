@@ -644,7 +644,7 @@ import A;
   EXPECT_TRUE(CI);
 
   auto Preamble =
-      buildPreamble(getFullPath("Use.cpp"), *CI, Use, /*InMemory=*/true,
+      buildPreamble(getFullPath("Use.cpp"), *CI, Use, PrecompiledPreamble::PCHStorageMode::InMemory,
                     /*Callback=*/nullptr);
   EXPECT_TRUE(Preamble);
   EXPECT_TRUE(Preamble->RequiredModules);
@@ -685,7 +685,7 @@ import :$part0^part.$part1^one;
   auto CI = buildCompilerInvocation(Inputs, DiagConsumer);
   ASSERT_TRUE(CI);
   auto Preamble =
-      buildPreamble(getFullPath("M.cppm"), *CI, Inputs, /*InMemory=*/true,
+      buildPreamble(getFullPath("M.cppm"), *CI, Inputs, PrecompiledPreamble::PCHStorageMode::InMemory,
                     /*Callback=*/nullptr);
   ASSERT_TRUE(Preamble);
 
@@ -741,7 +741,7 @@ void func() {
   EXPECT_TRUE(CI);
 
   auto Preamble =
-      buildPreamble(getFullPath("Use.cpp"), *CI, Use, /*InMemory=*/true,
+      buildPreamble(getFullPath("Use.cpp"), *CI, Use, PrecompiledPreamble::PCHStorageMode::InMemory,
                     /*Callback=*/nullptr);
   EXPECT_TRUE(Preamble);
   EXPECT_TRUE(Preamble->RequiredModules);
@@ -780,7 +780,7 @@ void func() {
   EXPECT_TRUE(CI);
 
   auto Preamble =
-      buildPreamble(getFullPath("Use.cpp"), *CI, Use, /*InMemory=*/true,
+      buildPreamble(getFullPath("Use.cpp"), *CI, Use, PrecompiledPreamble::PCHStorageMode::InMemory,
                     /*Callback=*/nullptr);
   EXPECT_TRUE(Preamble);
   EXPECT_TRUE(Preamble->RequiredModules);
@@ -1284,7 +1284,7 @@ int useB() { return onlyB; }
   auto CIA = buildCompilerInvocation(UseA, DiagConsumer);
   ASSERT_TRUE(CIA);
   auto PreambleA = buildPreamble(getFullPath("a/Use.cpp"), *CIA, UseA,
-                                 /*InMemory=*/true, /*Callback=*/nullptr);
+                                 PrecompiledPreamble::PCHStorageMode::InMemory, /*Callback=*/nullptr);
   ASSERT_TRUE(PreambleA);
   auto ASTA = ParsedAST::build(getFullPath("a/Use.cpp"), UseA, std::move(CIA),
                                {}, PreambleA);
@@ -1296,7 +1296,7 @@ int useB() { return onlyB; }
   auto CIB = buildCompilerInvocation(UseB, DiagConsumer);
   ASSERT_TRUE(CIB);
   auto PreambleB = buildPreamble(getFullPath("b/Use.cpp"), *CIB, UseB,
-                                 /*InMemory=*/true, /*Callback=*/nullptr);
+                                 PrecompiledPreamble::PCHStorageMode::InMemory, /*Callback=*/nullptr);
   ASSERT_TRUE(PreambleB);
   auto ASTB = ParsedAST::build(getFullPath("b/Use.cpp"), UseB, std::move(CIB),
                                {}, PreambleB);
@@ -1682,7 +1682,7 @@ struct TypeFromHeader {};
   ASSERT_TRUE(CI);
 
   auto Preamble =
-      buildPreamble(getFullPath("Use.cpp"), *CI, Inputs, /*StoreInMemory=*/true,
+      buildPreamble(getFullPath("Use.cpp"), *CI, Inputs, PrecompiledPreamble::PCHStorageMode::InMemory,
                     /*PeambleCallback=*/nullptr);
   ASSERT_TRUE(Preamble);
   EXPECT_EQ(Preamble->Preamble.getBounds().Size, 0u);
@@ -1721,7 +1721,7 @@ void use() {}
   ASSERT_TRUE(CI);
 
   auto Preamble = buildPreamble(getFullPath("Consumer.cpp"), *CI, Inputs,
-                                /*StoreInMemory=*/true,
+                                PrecompiledPreamble::PCHStorageMode::InMemory,
                                 /*PreambleCallback=*/nullptr);
   ASSERT_TRUE(Preamble);
   EXPECT_EQ(Preamble->Preamble.getBounds().Size, 0u);
@@ -1782,7 +1782,7 @@ export struct TypeFromModule {};
   ASSERT_TRUE(CI);
 
   auto Preamble =
-      buildPreamble(getFullPath("Use.cpp"), *CI, Inputs, /*StoreInMemory=*/true,
+      buildPreamble(getFullPath("Use.cpp"), *CI, Inputs, PrecompiledPreamble::PCHStorageMode::InMemory,
                     /*PeambleCallback=*/nullptr);
   ASSERT_TRUE(Preamble);
 

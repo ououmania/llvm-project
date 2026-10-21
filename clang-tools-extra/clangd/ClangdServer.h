@@ -118,6 +118,9 @@ public:
     /// This throttler controls which preambles may be built at a given time.
     clangd::PreambleThrottler *PreambleThrottler = nullptr;
 
+    /// If non-null, preamble PCH files are persisted to disk across restarts.
+    const clangd::PreambleCache *PreambleDiskCache = nullptr;
+
     /// Manages to build module files.
     ModulesBuilder *ModulesManager = nullptr;
 
@@ -251,6 +254,19 @@ public:
   /// preamble have been modified).
   void reparseOpenFilesIfNeeded(
       llvm::function_ref<bool(llvm::StringRef File)> Filter);
+
+  struct PrewarmResult {
+    /// Files accepted for background preamble construction.
+    unsigned Queued = 0;
+    /// Files ignored: relative paths, files open in the editor, or files
+    /// already pending.
+    unsigned Skipped = 0;
+  };
+  /// Builds the persistent preamble cache of \p Files in the background:
+  /// entries that are still valid are left alone, stale or missing ones are
+  /// built and stored. Returns without waiting for the builds.
+  /// Fails if the persistent preamble cache is not enabled.
+  llvm::Expected<PrewarmResult> prewarmPreambles(llvm::ArrayRef<Path> Files);
 
   /// Run code completion for \p File at \p Pos.
   ///
@@ -486,6 +502,9 @@ private:
   const ThreadsafeFS &TFS;
 
   void adjustParseInputs(ParseInputs &Inputs, PathRef File) const;
+  ParseInputs makeParseInputs(PathRef File, llvm::StringRef Contents,
+                              llvm::StringRef Version,
+                              bool ForceRebuild) const;
 
   Path ResourceDir;
   // The index used to look up symbols. This could be:
@@ -536,6 +555,13 @@ private:
 
   std::unique_ptr<ThreadsafeFS> DirtyFS;
   std::function<Context(PathRef)> ContextProvider;
+
+  // Options for the private TUScheduler used by prewarmPreambles().
+  TUScheduler::Options PrewarmOpts;
+  // Created on first use; declared last so it is destroyed before the members
+  // it references.
+  class PreambleWarmer;
+  std::unique_ptr<PreambleWarmer> Warmer;
 };
 
 } // namespace clangd

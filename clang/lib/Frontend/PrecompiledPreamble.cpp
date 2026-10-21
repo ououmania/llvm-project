@@ -28,6 +28,7 @@
 #include "llvm/Config/llvm-config.h"
 #include "llvm/Support/CrashRecoveryContext.h"
 #include "llvm/Support/FileSystem.h"
+#include "llvm/Support/FormatVariadic.h"
 #include "llvm/Support/ManagedStatic.h"
 #include "llvm/Support/Path.h"
 #include "llvm/Support/Process.h"
@@ -369,17 +370,27 @@ public:
     return S;
   }
 
-  enum class Kind { InMemory, TempFile };
+  static std::unique_ptr<PCHStorage> persistent(StringRef Path) {
+    std::unique_ptr<PCHStorage> S(new PCHStorage());
+    S->PersistentPath = Path.str();
+    return S;
+  }
+
+  enum class Kind { InMemory, TempFile, PersistentFile };
   Kind getKind() const {
     if (Memory)
       return Kind::InMemory;
     if (File)
       return Kind::TempFile;
-    llvm_unreachable("Neither Memory nor File?");
+    if (!PersistentPath.empty())
+      return Kind::PersistentFile;
+    llvm_unreachable("Neither Memory nor File nor PersistentPath?");
   }
   llvm::StringRef filePath() const {
-    assert(getKind() == Kind::TempFile);
-    return File->getFilePath();
+    assert(getKind() == Kind::TempFile || getKind() == Kind::PersistentFile);
+    if (getKind() == Kind::TempFile)
+      return File->getFilePath();
+    return PersistentPath;
   }
   llvm::StringRef memoryContents() const {
     assert(getKind() == Kind::InMemory);
@@ -402,6 +413,7 @@ private:
 
   std::shared_ptr<PCHBuffer> Memory;
   std::unique_ptr<TempPCHFile> File;
+  std::string PersistentPath; // non-empty => PersistentFile kind; not deleted on destruction
 };
 
 PrecompiledPreamble::~PrecompiledPreamble() = default;
@@ -414,8 +426,9 @@ llvm::ErrorOr<PrecompiledPreamble> PrecompiledPreamble::Build(
     const llvm::MemoryBuffer *MainFileBuffer, PreambleBounds Bounds,
     IntrusiveRefCntPtr<DiagnosticsEngine> Diagnostics,
     IntrusiveRefCntPtr<llvm::vfs::FileSystem> VFS,
-    std::shared_ptr<PCHContainerOperations> PCHContainerOps, bool StoreInMemory,
-    StringRef StoragePath, PreambleCallbacks &Callbacks) {
+    std::shared_ptr<PCHContainerOperations> PCHContainerOps,
+    PCHStorageMode Mode, StringRef StoragePath,
+    PreambleCallbacks &Callbacks) {
   assert(VFS && "VFS is null");
 
   auto PreambleInvocation = std::make_shared<CompilerInvocation>(Invocation);
@@ -425,16 +438,22 @@ llvm::ErrorOr<PrecompiledPreamble> PrecompiledPreamble::Build(
 
   std::shared_ptr<PCHBuffer> Buffer = std::make_shared<PCHBuffer>();
   std::unique_ptr<PCHStorage> Storage;
-  if (StoreInMemory) {
+  std::string PersistentPath; // non-empty when Mode == PersistentFile
+  if (Mode == PCHStorageMode::InMemory) {
     Storage = PCHStorage::inMemory(Buffer);
   } else {
-    // Create a temporary file for the precompiled preamble. In rare
-    // circumstances, this can fail.
+    // For both TempFile and PersistentFile, start with a temp file.
+    // PersistentFile mode uses the parent directory of StoragePath.
+    StringRef TempDir = (Mode == PCHStorageMode::PersistentFile)
+                            ? llvm::sys::path::parent_path(StoragePath)
+                            : StoragePath;
     std::unique_ptr<TempPCHFile> PreamblePCHFile =
-        TempPCHFile::create(StoragePath);
+        TempPCHFile::create(TempDir);
     if (!PreamblePCHFile)
       return BuildPreambleError::CouldntCreateTempFile;
     Storage = PCHStorage::file(std::move(PreamblePCHFile));
+    if (Mode == PCHStorageMode::PersistentFile)
+      PersistentPath = StoragePath.str();
   }
 
   // Save the preamble text for later; we'll need to compare against it for
@@ -447,7 +466,8 @@ llvm::ErrorOr<PrecompiledPreamble> PrecompiledPreamble::Build(
   // Tell the compiler invocation to generate a temporary precompiled header.
   FrontendOpts.ProgramAction = frontend::GeneratePCH;
   FrontendOpts.OutputFile = std::string(
-      StoreInMemory ? getInMemoryPreamblePath() : Storage->filePath());
+      Mode == PCHStorageMode::InMemory ? getInMemoryPreamblePath()
+                                       : Storage->filePath());
   PreprocessorOpts.PrecompiledPreambleBytes.first = 0;
   PreprocessorOpts.PrecompiledPreambleBytes.second = false;
   // Inform preprocessor to record conditional stack when building the preamble.
@@ -507,7 +527,7 @@ llvm::ErrorOr<PrecompiledPreamble> PrecompiledPreamble::Build(
 
   auto Act = std::make_unique<PrecompilePreambleAction>(
       std::move(Buffer),
-      /*WritePCHFile=*/Storage->getKind() == PCHStorage::Kind::TempFile,
+      /*WritePCHFile=*/Mode != PCHStorageMode::InMemory,
       Callbacks);
   if (!Act->BeginSourceFile(*Clang, Clang->getFrontendOpts().Inputs[0]))
     return BuildPreambleError::BeginSourceFileFailed;
@@ -568,6 +588,21 @@ llvm::ErrorOr<PrecompiledPreamble> PrecompiledPreamble::Build(
   CICleanup.unregister();
   Clang.reset();
   Storage->shrink();
+
+  // For PersistentFile mode, rename the temp file to the stable path and
+  // switch to persistent storage (destructor won't delete the file).
+  if (!PersistentPath.empty()) {
+    StringRef TempPath = Storage->filePath();
+    if (auto EC = llvm::sys::fs::rename(TempPath, PersistentPath)) {
+      // Rename failed — fall back to temp file behavior.
+      (void)EC;
+    } else {
+      // Old TempPCHFile is destroyed here; its removeFile() on the old path
+      // is a harmless no-op since the file was already renamed away.
+      Storage = PCHStorage::persistent(PersistentPath);
+    }
+  }
+
   return PrecompiledPreamble(
       std::move(Storage), std::move(PreambleBytes), PreambleEndsAtStartOfLine,
       std::move(FilesInPreamble), std::move(MissingFiles));
@@ -581,11 +616,11 @@ std::size_t PrecompiledPreamble::getSize() const {
   switch (Storage->getKind()) {
   case PCHStorage::Kind::InMemory:
     return Storage->memoryContents().size();
-  case PCHStorage::Kind::TempFile: {
+  case PCHStorage::Kind::TempFile:
+  case PCHStorage::Kind::PersistentFile: {
     uint64_t Result;
     if (llvm::sys::fs::file_size(Storage->filePath(), Result))
       return 0;
-
     assert(Result <= std::numeric_limits<std::size_t>::max() &&
            "file size did not fit into size_t");
     return Result;
@@ -594,10 +629,37 @@ std::size_t PrecompiledPreamble::getSize() const {
   llvm_unreachable("Unhandled storage kind");
 }
 
+llvm::StringRef PrecompiledPreamble::getFilePath() const {
+  if (Storage->getKind() == PCHStorage::Kind::TempFile ||
+      Storage->getKind() == PCHStorage::Kind::PersistentFile)
+    return Storage->filePath();
+  return {};
+}
+
+llvm::ErrorOr<PrecompiledPreamble> PrecompiledPreamble::LoadFromFile(
+    StringRef PCHPath, std::vector<char> PreambleBytes,
+    bool PreambleEndsAtStartOfLine,
+    llvm::StringMap<PreambleFileHash> FilesInPreamble,
+    llvm::StringSet<> MissingFiles) {
+  if (!llvm::sys::fs::exists(PCHPath))
+    return std::make_error_code(std::errc::no_such_file_or_directory);
+  auto Storage = PCHStorage::persistent(PCHPath);
+  return PrecompiledPreamble(std::move(Storage), std::move(PreambleBytes),
+                             PreambleEndsAtStartOfLine,
+                             std::move(FilesInPreamble),
+                             std::move(MissingFiles));
+}
+
 bool PrecompiledPreamble::CanReuse(const CompilerInvocation &Invocation,
                                    const llvm::MemoryBufferRef &MainFileBuffer,
                                    PreambleBounds Bounds,
-                                   llvm::vfs::FileSystem &VFS) const {
+                                   llvm::vfs::FileSystem &VFS,
+                                   std::string *Reason) const {
+  auto Fail = [Reason](const llvm::Twine &Msg) {
+    if (Reason)
+      *Reason = Msg.str();
+    return false;
+  };
 
   assert(
       Bounds.Size <= MainFileBuffer.getBufferSize() &&
@@ -615,7 +677,7 @@ bool PrecompiledPreamble::CanReuse(const CompilerInvocation &Invocation,
       PreambleEndsAtStartOfLine != Bounds.PreambleEndsAtStartOfLine ||
       !std::equal(PreambleBytes.begin(), PreambleBytes.end(),
                   MainFileBuffer.getBuffer().begin()))
-    return false;
+    return Fail("main file preamble text changed");
   // The preamble has not changed. We may be able to re-use the precompiled
   // preamble.
 
@@ -629,7 +691,7 @@ bool PrecompiledPreamble::CanReuse(const CompilerInvocation &Invocation,
     if (!moveOnNoError(VFS.status(R.second), Status)) {
       // If we can't stat the file we're remapping to, assume that something
       // horrible happened.
-      return false;
+      return Fail("cannot stat remapped file " + R.second);
     }
     // If a mapped file was previously missing, then it has changed.
     llvm::SmallString<128> MappedPath(R.first);
@@ -663,7 +725,7 @@ bool PrecompiledPreamble::CanReuse(const CompilerInvocation &Invocation,
       // The file's buffer was remapped and the file was not found in VFS.
       // Check whether it matches up with the previous mapping.
       if (OverridenFileBuffer->second != F.second)
-        return false;
+        return Fail("overridden buffer changed: " + F.first());
       continue;
     }
 
@@ -671,7 +733,7 @@ bool PrecompiledPreamble::CanReuse(const CompilerInvocation &Invocation,
     if (!moveOnNoError(VFS.status(F.first()), Status)) {
       // If the file's buffer is not remapped and we can't stat it,
       // assume that something horrible happened.
-      return false;
+      return Fail("cannot stat dependency " + F.first());
     }
 
     std::map<llvm::sys::fs::UniqueID, PreambleFileHash>::iterator Overridden =
@@ -680,26 +742,31 @@ bool PrecompiledPreamble::CanReuse(const CompilerInvocation &Invocation,
       // This file was remapped; check whether the newly-mapped file
       // matches up with the previous mapping.
       if (Overridden->second != F.second)
-        return false;
+        return Fail("remapped file changed: " + F.first());
       continue;
     }
 
     // Neither the file's buffer nor the file itself was remapped;
     // check whether it has changed on disk.
+    time_t CurModTime = llvm::sys::toTimeT(Status.getLastModificationTime());
     if (Status.getSize() != uint64_t(F.second.Size) ||
-        llvm::sys::toTimeT(Status.getLastModificationTime()) !=
-            F.second.ModTime)
-      return false;
+        CurModTime != F.second.ModTime)
+      return Fail(llvm::formatv(
+          "dependency changed: {0} (size {1} -> {2}, mtime {3} -> {4})",
+          F.first(), F.second.Size, Status.getSize(),
+          static_cast<int64_t>(F.second.ModTime),
+          static_cast<int64_t>(CurModTime))
+                      .str());
   }
   for (const auto &F : MissingFiles) {
     // A missing file may be "provided" by an override buffer or file.
     if (OverriddenAbsPaths.count(F.getKey()))
-      return false;
+      return Fail("previously missing file now overridden: " + F.getKey());
     // If a file previously recorded as missing exists as a regular file, then
     // consider the preamble out-of-date.
     if (auto Status = VFS.status(F.getKey())) {
       if (Status->isRegularFile())
-        return false;
+        return Fail("previously missing file now exists: " + F.getKey());
     }
   }
   return true;
@@ -784,7 +851,8 @@ void PrecompiledPreamble::configurePreamble(
 void PrecompiledPreamble::setupPreambleStorage(
     const PCHStorage &Storage, PreprocessorOptions &PreprocessorOpts,
     IntrusiveRefCntPtr<llvm::vfs::FileSystem> &VFS) {
-  if (Storage.getKind() == PCHStorage::Kind::TempFile) {
+  if (Storage.getKind() == PCHStorage::Kind::TempFile ||
+      Storage.getKind() == PCHStorage::Kind::PersistentFile) {
     llvm::StringRef PCHPath = Storage.filePath();
     PreprocessorOpts.ImplicitPCHInclude = PCHPath.str();
 

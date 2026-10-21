@@ -104,6 +104,7 @@ add_clang_library(clangDaemon STATIC
   Quality.cpp
   ParsedAST.cpp
   Preamble.cpp
+  PreambleCache.cpp
   RIFF.cpp
   Selection.cpp
   SemanticHighlighting.cpp
