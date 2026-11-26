@@ -98,9 +98,6 @@ private:
   /// nullopt when not in a WMMA window.
   std::optional<unsigned> CurrentCoExecStage;
 
-  /// Cycle when the current WMMA window started.
-  unsigned CoExecWindowStartCycle = 0;
-
   /// Tracks cycles until TRANS can be issued again (back-to-back TRANS hazard).
   unsigned CyclesUntilTRANS = 0;
 
@@ -185,11 +182,11 @@ private:
   /// every window WindowFor can return, and zero if it accepts none. Each
   /// window is paired with the distance to the instruction that supplied it.
   int getMaxWindowDeficit(int MaxWindow, WindowForFn WindowFor) const;
+  int getMaxVALUWindowDeficit(int MaxWindow, WindowForFn WindowFor) const;
 
   int getWaitStatesSince(IsHazardFn IsHazard, int Limit,
                          GetNumWaitStatesFn GetNumWaitStates) const;
   int getWaitStatesSince(IsHazardFn IsHazard, int Limit) const;
-  int getWaitStatesSinceVALU(IsHazardFn IsHazard, int Limit) const;
   int getWaitStatesSinceDef(unsigned Reg, IsHazardFn IsHazardDef,
                             int Limit) const;
   int getWaitStatesSinceSetReg(IsHazardFn IsHazard, int Limit) const;
@@ -246,9 +243,11 @@ private:
   bool fixRequiredExportPriority(MachineInstr *MI);
   bool fixGetRegWaitIdle(MachineInstr *MI);
   bool fixDsAtomicAsyncBarrierArriveB64(MachineInstr *MI);
+  bool fixBarrierJoinCompletion(MachineInstr *MI);
   bool fixScratchBaseForwardingHazard(MachineInstr *MI);
   bool fixSetRegMode(MachineInstr *MI);
   bool fixTDM(MachineInstr *MI);
+  bool fixTransF16ToPartialVGPRWriteHazard(MachineInstr *MI);
 
   /// Wait states before \p Consumer may read \p Reg, holding \p Producer's
   /// result, as srcC if \p IsSrcC or as srcA/srcB otherwise.
